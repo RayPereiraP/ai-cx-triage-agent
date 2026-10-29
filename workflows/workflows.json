@@ -1,0 +1,187 @@
+{
+  "name": "AI CX Incident Triage & Sentiment Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ticket-feedback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Webhook Inbound Ticket",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "incident-triage-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nreturn items.map(item => {\n  const data = item.json;\n  // Sanitização simples de PII (anonimização básica para LGPD)\n  let sanitizedComment = (data.comment || '')\n    .replace(/\\b\\d{3}\\.?\\d{3}\\.?\\d{3}-?\\d{2}\\b/g, '[CPF REMOVIDO]')\n    .replace(/\\b(?:\\+?55\\s?)?(?:\\(?\\d{2}\\)?\\s?)?\\d{4,5}-?\\d{4}\\b/g, '[TELEFONE REMOVIDO]');\n    \n  return {\n    json: {\n      ticket_id: data.ticket_id || `TCK-${Date.now()}`,\n      customer_id: data.customer_id || 'ANONYMOUS',\n      order_id: data.order_id || 'N/A',\n      original_comment: data.comment,\n      sanitized_comment: sanitizedComment,\n      rating: Number(data.rating) || 0,\n      received_at: new Date().toISOString()\n    }\n  };\n});"
+      },
+      "id": "2",
+      "name": "Sanitize & Pre-process PII",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.OPENAI_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"temperature\": 0,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"Você é um analista especialista de CX e Operações Logísticas. Analise a avaliação do cliente e responda ESTRITAMENTE em JSON seguindo este esquema:\\n{\\n  \\\"categoria\\\": \\\"Comida Fria\\\" | \\\"Atraso na Entrega\\\" | \\\"Pedido Incompleto\\\" | \\\"Qualidade da Comida\\\" | \\\"Atendimento ao Cliente\\\" | \\\"Elogio\\\" | \\\"Outros\\\",\\n  \\\"sentimento\\\": \\\"Positivo\\\" | \\\"Neutro\\\" | \\\"Negativo\\\",\\n  \\\"nivel_urgencia\\\": 1 | 2 | 3 | 4 | 5,\\n  \\\"risco_churn\\\": \\\"Baixo\\\" | \\\"Médio\\\" | \\\"Alto\\\",\\n  \\\"resumo_executivo\\\": \\\"resumo conciso em 1 linha\\\",\\n  \\\"acao_sugerida\\\": \\\"ação operacional recomendada\\\"\\n}\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Avaliação: {{ $json.sanitized_comment }}\\nNota atribuída pelo cliente: {{ $json.rating }}/5\"\n    }\n  ]\n}"
+      },
+      "id": "3",
+      "name": "LLM Structured Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst preProcessed = $('Sanitize & Pre-process PII').first().json;\n\nlet parsedLLM = {};\ntry {\n  parsedLLM = JSON.parse(response.choices[0].message.content);\n} catch (e) {\n  parsedLLM = {\n    categoria: 'Erro de Parsing',\n    sentimento: 'Neutro',\n    nivel_urgencia: 3,\n    risco_churn: 'Médio',\n    resumo_executivo: 'Falha no processamento da LLM',\n    acao_sugerida: 'Triagem manual requerida'\n  };\n}\n\nreturn {\n  json: {\n    ...preProcessed,\n    ...parsedLLM,\n    is_critical: parsedLLM.nivel_urgencia >= 4 || parsedLLM.risco_churn === 'Alto' || preProcessed.rating <= 2\n  }\n};"
+      },
+      "id": "4",
+      "name": "Parse & Route Evaluator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.is_critical }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "5",
+      "name": "Is Critical Incident?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": \"🚨 *INCIDENTE CRÍTICO DE CX DETECTADO* 🚨\\n*Ticket:* `{{ $json.ticket_id }}`\\n*Nota:* {{ $json.rating }}/5\\n*Categoria:* {{ $json.categoria }}\\n*Urgência:* Nível {{ $json.nivel_urgencia }}/5\\n*Risco de Churn:* {{ $json.risco_churn }}\\n*Resumo:* {{ $json.resumo_executivo }}\\n*Ação Recomendada:* {{ $json.acao_sugerida }}\\n*Comentário Original:* \\\"{{ $json.sanitized_comment }}\\\"\"\n}"
+      },
+      "id": "6",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1360, 200]
+    },
+    {
+      "parameters": {
+        "options": {
+          "responseCode": 200
+        },
+        "responseBody": "={\n  \"status\": \"success\",\n  \"ticket_id\": \"{{ $json.ticket_id }}\",\n  \"processed\": true,\n  \"critical_routed\": \"{{ $json.is_critical }}\",\n  \"analysis\": {\n    \"categoria\": \"{{ $json.categoria }}\",\n    \"urgencia\": {{ $json.nivel_urgencia }},\n    \"risco_churn\": \"{{ $json.risco_churn }}\"\n  }\n}"
+      },
+      "id": "7",
+      "name": "Return Success Payload",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1600, 300]
+    }
+  ],
+  "connections": {
+    "Webhook Inbound Ticket": {
+      "main": [
+        [
+          {
+            "node": "Sanitize & Pre-process PII",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize & Pre-process PII": {
+      "main": [
+        [
+          {
+            "node": "LLM Structured Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Structured Analysis": {
+      "main": [
+        [
+          {
+            "node": "Parse & Route Evaluator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Route Evaluator": {
+      "main": [
+        [
+          {
+            "node": "Is Critical Incident?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Critical Incident?": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Success Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Return Success Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
